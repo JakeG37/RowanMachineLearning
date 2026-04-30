@@ -1,0 +1,27 @@
+{
+  "sector": "Technology",
+  "selected_model_name": "knn",
+  "tickers": [
+    "AAPL",
+    "MSFT",
+    "NVDA",
+    "AMD",
+    "ORCL",
+    "CRM",
+    "ADBE"
+  ],
+  "years": 10,
+  "rows": 17500,
+  "features": [
+    "volume_change",
+    "close_to_open",
+    "high_low_spread",
+    "ma_ratio_5",
+    "ma_ratio_10",
+    "volatility_5",
+    "volatility_10",
+    "rsi_14"
+  ],
+  "target": "target_next_day_up",
+  "model_path": "selected_model_outputs\\technology_knn.joblib"
+}
