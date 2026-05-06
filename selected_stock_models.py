@@ -24,6 +24,7 @@ DEPLOY_DIR.mkdir(exist_ok=True)
 # Add more tickers here as you finalize model choices.
 SELECTED_MODELS_BY_TICKER = {
     "AAPL": "svc_rbf",
+    "MSFT": "gaussian_nb",
 }
 
 

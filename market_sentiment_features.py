@@ -17,6 +17,7 @@ SENTIMENT_TO_SCORE = {
 
 OUTPUT_DIR = Path("sentiment_feature_outputs")
 OUTPUT_DIR.mkdir(exist_ok=True)
+FINBERT_BATCH_SIZE = int(os.getenv("FINBERT_BATCH_SIZE", "16"))
 
 _finbert = None
 
@@ -52,6 +53,30 @@ def score_text_sentiment(text):
     confidence = float(result["score"])
     score = SENTIMENT_TO_SCORE.get(label.lower(), 0.5)
     return label, confidence, score
+
+
+def score_texts_sentiment(texts, batch_size=FINBERT_BATCH_SIZE):
+    prepared_texts = [(text or "")[:512] for text in texts]
+    valid_texts = [text for text in prepared_texts if text]
+    predictions = (
+        iter(get_finbert_pipeline()(valid_texts, batch_size=batch_size))
+        if valid_texts
+        else iter([])
+    )
+    results = []
+
+    for text in prepared_texts:
+        if not text:
+            results.append((None, None, None))
+            continue
+
+        result = next(predictions)
+        label = result["label"]
+        confidence = float(result["score"])
+        score = SENTIMENT_TO_SCORE.get(label.lower(), 0.5)
+        results.append((label, confidence, score))
+
+    return results
 
 
 def flatten_history_columns(history, ticker):
@@ -191,10 +216,12 @@ def score_article_frame(symbol, article_df, pause_seconds=0.05):
         return article_df
 
     scored_rows = []
-    for article in article_df.itertuples(index=False):
-        text_for_scoring = article.summary or article.title
-        label, confidence, score = score_text_sentiment(text_for_scoring)
+    articles = list(article_df.itertuples(index=False))
+    sentiment_results = score_texts_sentiment(
+        [article.summary or article.title for article in articles]
+    )
 
+    for article, (label, confidence, score) in zip(articles, sentiment_results):
         scored_rows.append(
             {
                 "symbol": symbol,
