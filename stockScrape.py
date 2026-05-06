@@ -42,7 +42,7 @@ FINBERT_MODEL: str = "ProsusAI/finbert"
 DEVICE: int = 0 if torch.cuda.is_available() else -1
 
 # Sentiment label to numeric score mapping
-SENTIMENT_SCORE_MAP: dict[str, int] = {
+SENTIMENT_SCORE_MAP: dict[str, float] = {
     "positive":  1.0,
     "neutral":   0.5,
     "negative":  0.0,
@@ -424,12 +424,12 @@ def apply_sentiment(
 
     Each post receives:
       sentiment_label    — "positive" | "neutral" | "negative"
-      sentiment_score    — 1 | 0 | -1
+      sentiment_score: 1.0 | 0.5 | 0.0
       confidence         — FinBERT probability for the winning label
       weighted_sentiment — sentiment_score x confidence
 
-    weighted_sentiment is the primary signal fed into the composite score.
-    It encodes both direction and model certainty in a single value.
+    The aggregate social score is normalized back to the same 0 to 1
+    sentiment scale used by news and EDGAR, where 0.5 is neutral.
     """
     log.info(f"Running FinBERT on {len(posts)} posts (batch_size={batch_size})...")
 
@@ -491,14 +491,17 @@ def compute_aggregate_score(df: pd.DataFrame) -> dict:
     genuine community conviction over low-engagement noise.
     Scores clipped to minimum 1 to prevent division-by-zero.
     """
-    weight_col   = df["score"].clip(lower=1)
+    weight_col = df["score"].clip(lower=1) * df["confidence"].fillna(0)
     total_weight = weight_col.sum()
-    weighted_sum = (df["weighted_sentiment"] * weight_col).sum()
+    if total_weight == 0:
+        composite_sentiment = float(df["sentiment_score"].mean())
+    else:
+        composite_sentiment = float((df["sentiment_score"] * weight_col).sum() / total_weight)
 
     return {
         "ticker":               df["ticker"].iloc[0],
-        "composite_sentiment":  round(weighted_sum / total_weight, 4),
-        "avg_sentiment":        round(df["weighted_sentiment"].mean(), 4),
+        "composite_sentiment":  round(composite_sentiment, 4),
+        "avg_sentiment":        round(df["sentiment_score"].mean(), 4),
         "bullish_pct":          round((df["sentiment_label"] == "positive").mean(), 4),
         "neutral_pct":          round((df["sentiment_label"] == "neutral").mean(), 4),
         "bearish_pct":          round((df["sentiment_label"] == "negative").mean(), 4),
@@ -519,9 +522,9 @@ def build_social_summary(df: pd.DataFrame) -> dict:
     if df.empty:
         return {
             "article_count": 0,
-            "average_sentiment_score": 0.0,
-            "weighted_sentiment_score": 0.0,
-            "overall_sentiment_score": 0.0,
+            "average_sentiment_score": 0.5,
+            "weighted_sentiment_score": 0.5,
+            "overall_sentiment_score": 0.5,
             "overall_sentiment_label": "Neutral",
             "positive_articles": 0,
             "negative_articles": 0,
@@ -535,7 +538,7 @@ def build_social_summary(df: pd.DataFrame) -> dict:
     return {
         "article_count": int(len(df)),
         "average_sentiment_score": round(float(df["sentiment_score"].mean()), 4),
-        "weighted_sentiment_score": round(float(df["weighted_sentiment"].mean()), 4),
+        "weighted_sentiment_score": round(overall_score, 4),
         "overall_sentiment_score": round(overall_score, 4),
         "overall_sentiment_label": score_to_outlook_label(overall_score),
         "positive_articles": int(counts.get("positive", 0)),
@@ -559,7 +562,7 @@ def build_social_overall_summary(df: pd.DataFrame, sentiment_summary: dict) -> s
 
     return (
         f"Across {item_count} recent Reddit posts, the social sentiment looks {tone} "
-        f"with an aggregate score of {score} on a -1 to 1 scale, where 0 is neutral. "
+        f"with an aggregate score of {score} on a 0 to 1 scale, where 0.5 is neutral. "
         f"The strongest discussion activity came from {subreddit_text}. "
         f"Recent posts focused on: {title_text}."
     )

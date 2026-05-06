@@ -28,6 +28,7 @@ HEADERS_ARCHIVE = {
 }
 
 TARGET_FORMS = {"8-K", "10-Q", "10-K"}
+FINBERT_BATCH_SIZE = int(os.getenv("FINBERT_BATCH_SIZE", "16"))
 
 EVENT_KEYWORDS = {
     "earnings": [
@@ -135,6 +136,28 @@ def get_finbert_sentiment(text):
         return None, None
 
 
+def get_finbert_sentiments(texts, batch_size=FINBERT_BATCH_SIZE):
+    prepared_texts = [(text or "")[:512] for text in texts]
+    valid_texts = [text for text in prepared_texts if text]
+
+    try:
+        predictions = iter(get_finbert_pipeline()(valid_texts, batch_size=batch_size)) if valid_texts else iter([])
+    except Exception as e:
+        print(f"Sentiment batch error: {e}")
+        return [(None, None) for _ in prepared_texts]
+
+    results = []
+    for text in prepared_texts:
+        if not text:
+            results.append((None, None))
+            continue
+
+        result = next(predictions)
+        results.append((result["label"], result["score"]))
+
+    return results
+
+
 def detect_event_tags(text):
     if not text:
         return []
@@ -147,6 +170,97 @@ def detect_event_tags(text):
             found_tags.append(tag)
 
     return found_tags
+
+
+def describe_form_type(form):
+    form = str(form).upper()
+    if form == "10-K":
+        return "annual report"
+    if form == "10-Q":
+        return "quarterly report"
+    if form == "8-K":
+        return "current report about a recent company event"
+    return "SEC filing"
+
+
+def format_event_tag(tag):
+    return tag.replace("_", " ")
+
+
+def is_readable_filing_sentence(sentence):
+    sentence = clean_text(sentence)
+    if len(sentence) < 45 or len(sentence) > 300:
+        return False
+
+    lower_sentence = sentence.lower()
+    noisy_terms = [
+        "xbrl", "xbrli", "iso4217", "dei:", "aapl:", "0000", "contextref",
+        "unitref", "decimals", "p1y", "p329d", "member]", "duration_",
+    ]
+    if any(term in lower_sentence for term in noisy_terms):
+        return False
+
+    tokens = sentence.split()
+    if len(tokens) < 8:
+        return False
+    if any(len(token) > 38 for token in tokens):
+        return False
+
+    alpha_chars = sum(1 for char in sentence if char.isalpha())
+    visible_chars = sum(1 for char in sentence if not char.isspace())
+    if visible_chars == 0:
+        return False
+
+    return alpha_chars / visible_chars >= 0.55
+
+
+def extract_plain_filing_excerpt(text, max_sentences=3):
+    if not text:
+        return ""
+
+    important_terms = [
+        "revenue", "net sales", "income", "earnings", "cash", "margin",
+        "risk", "results", "operations", "guidance", "agreement",
+        "appointed", "resigned", "acquisition", "litigation",
+    ]
+    sentences = re.split(r"(?<=[.!?])\s+", clean_text(text))
+    readable_sentences = [
+        sentence.strip()
+        for sentence in sentences
+        if is_readable_filing_sentence(sentence)
+    ]
+    priority_sentences = [
+        sentence
+        for sentence in readable_sentences
+        if any(term in sentence.lower() for term in important_terms)
+    ]
+    selected = (priority_sentences or readable_sentences)[:max_sentences]
+    return " ".join(selected)
+
+
+def build_plain_language_filing_summary(company_name, form, filing_date, description, event_tags, text):
+    form_description = describe_form_type(form)
+    filing_date_text = pd.Timestamp(filing_date).date().isoformat()
+    summary_parts = [
+        f"{company_name} filed a {form} {form_description} with the SEC on {filing_date_text}."
+    ]
+
+    if description:
+        summary_parts.append(f"The filing description is: {description}.")
+
+    if event_tags:
+        tags_text = ", ".join(format_event_tag(tag) for tag in event_tags)
+        summary_parts.append(f"Detected themes include {tags_text}.")
+    else:
+        summary_parts.append(
+            "No specific event theme was automatically detected, so this should be read as general filing context."
+        )
+
+    excerpt = extract_plain_filing_excerpt(text)
+    if excerpt:
+        summary_parts.append(f"Plain-language excerpt: {excerpt}")
+
+    return " ".join(summary_parts)
 
 
 # =============================
@@ -272,6 +386,7 @@ def build_edgar_dataset(ticker, days_back=30, delay=0.2, max_filings=None):
         print(target_filings[["form", "filingDate"]].head())
 
     data = []
+    sentiment_inputs = []
 
     for i, row in enumerate(target_filings.itertuples(index=False), start=1):
         filing_url = build_filing_url(cik, row.accessionNumber, row.primaryDocument)
@@ -289,9 +404,17 @@ def build_edgar_dataset(ticker, days_back=30, delay=0.2, max_filings=None):
             print("Skipped: filing text too short")
             continue
 
-        summary = text[:1000]
-        sentiment_label, sentiment_confidence = get_finbert_sentiment(text)
         event_tags = detect_event_tags(text)
+        summary = build_plain_language_filing_summary(
+            company_name=company_name,
+            form=row.form,
+            filing_date=row.filingDate,
+            description=row.primaryDocDescription,
+            event_tags=event_tags,
+            text=text,
+        )
+        sentiment_input = extract_plain_filing_excerpt(text, max_sentences=6) or summary
+        sentiment_inputs.append(sentiment_input)
 
         data.append({
             "ticker": ticker.upper(),
@@ -301,8 +424,6 @@ def build_edgar_dataset(ticker, days_back=30, delay=0.2, max_filings=None):
             "title": title,
             "url": filing_url,
             "summary": summary,
-            "sentiment_label": sentiment_label,
-            "sentiment_confidence": sentiment_confidence,
             "text": text,
             "text_length": len(text),
 
@@ -318,6 +439,10 @@ def build_edgar_dataset(ticker, days_back=30, delay=0.2, max_filings=None):
         })
 
         time.sleep(delay)
+
+    for row, (sentiment_label, sentiment_confidence) in zip(data, get_finbert_sentiments(sentiment_inputs)):
+        row["sentiment_label"] = sentiment_label
+        row["sentiment_confidence"] = sentiment_confidence
 
     df = pd.DataFrame(data)
     print(f"\nFinal dataset size: {len(df)} filings")

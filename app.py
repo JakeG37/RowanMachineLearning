@@ -1,6 +1,7 @@
 import html
 import os
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 from urllib.parse import parse_qs
 
 import pandas as pd
@@ -18,6 +19,7 @@ from stockScrape import analyze_social_sentiment
 
 HOST = "127.0.0.1"
 PORT = 8000
+STOCK_MODEL_SELECTION_DIR = Path("stock_model_selection_outputs")
 
 
 def safe_text(value):
@@ -54,12 +56,31 @@ def normalize_social_for_combined_snapshot(social_df):
     return normalized
 
 
-def render_content_cards(content_df, empty_message, link_label):
-    if content_df is None or getattr(content_df, "empty", True):
-        return f"<p class='muted'>{safe_text(empty_message)}</p>"
+def load_historical_accuracy_for_ticker(ticker, model_name):
+    summary_path = STOCK_MODEL_SELECTION_DIR / f"{ticker.lower()}_summary.csv"
+    if not summary_path.exists():
+        return None
 
+    summary_df = pd.read_csv(summary_path)
+    if summary_df.empty or "accuracy_mean" not in summary_df.columns:
+        return None
+
+    model_rows = summary_df
+    if model_name and "model_name" in summary_df.columns:
+        selected_rows = summary_df[summary_df["model_name"] == model_name]
+        if not selected_rows.empty:
+            model_rows = selected_rows
+
+    accuracy = pd.to_numeric(model_rows.iloc[0].get("accuracy_mean"), errors="coerce")
+    if pd.isna(accuracy):
+        return None
+
+    return float(accuracy)
+
+
+def render_item_cards(content_df, link_label):
     cards = []
-    for item in content_df.head(6).itertuples(index=False):
+    for item in content_df.itertuples(index=False):
         sentiment_label = getattr(item, "sentiment_label", "Unknown")
         sentiment_class = sentiment_badge_class(sentiment_label)
 
@@ -75,6 +96,37 @@ def render_content_cards(content_df, empty_message, link_label):
             """
         )
     return "".join(cards)
+
+
+def render_grouped_content_cards(content_df, empty_message, link_label):
+    if content_df is None or getattr(content_df, "empty", True):
+        return f"<p class='muted'>{safe_text(empty_message)}</p>"
+
+    groups = [
+        ("Positive", "positive", "No positive items found."),
+        ("Negative", "negative", "No negative items found."),
+        ("Neutral", "neutral", "No neutral items found."),
+    ]
+    working_df = content_df.copy()
+    working_df["sentiment_group"] = working_df["sentiment_label"].fillna("").str.strip().str.lower()
+
+    sections = []
+    for title, group_value, group_empty_message in groups:
+        group_df = working_df[working_df["sentiment_group"] == group_value].head(6)
+        if group_df.empty:
+            body_html = f"<p class='muted'>{safe_text(group_empty_message)}</p>"
+        else:
+            body_html = f"<div class='articles-grid'>{render_item_cards(group_df, link_label)}</div>"
+
+        sections.append(
+            f"""
+            <section class="sentiment-group">
+                <h3>{safe_text(title)}</h3>
+                {body_html}
+            </section>
+            """
+        )
+    return "".join(sections)
 
 
 def render_sentiment_panel(title, sentiment, summary_text):
@@ -151,9 +203,17 @@ def render_results(ticker, result):
     prediction = result.get("prediction_result")
     prediction_error = result.get("prediction_error")
 
-    confidence_text = "Unavailable"
+    probability_up_text = "Unavailable"
     if prediction and prediction.get("probability_up") is not None:
-        confidence_text = f"{prediction['probability_up']:.3f}"
+        probability_up_text = f"{prediction['probability_up']:.3f}"
+
+    historical_accuracy_text = "Unavailable"
+    if prediction:
+        model_metadata = prediction.get("model_metadata", {})
+        model_name = model_metadata.get("selected_model_name") or model_metadata.get("best_model_name")
+        historical_accuracy = load_historical_accuracy_for_ticker(ticker, model_name)
+        if historical_accuracy is not None:
+            historical_accuracy_text = f"{historical_accuracy:.1%}"
 
     prediction_message_html = "<p class='muted'>Prediction unavailable for this ticker's selected stock model.</p>"
     if prediction_error:
@@ -179,8 +239,12 @@ def render_results(ticker, result):
                         <div class="metric-value">{safe_text(prediction['prediction_label'])}</div>
                     </div>
                     <div>
-                        <div class="metric-label">Confidence</div>
-                        <div class="metric-value">{safe_text(confidence_text)}</div>
+                        <div class="metric-label">Probability Up</div>
+                        <div class="metric-value">{safe_text(probability_up_text)}</div>
+                    </div>
+                    <div>
+                        <div class="metric-label">Historical Accuracy</div>
+                        <div class="metric-value">{safe_text(historical_accuracy_text)}</div>
                     </div>
                 </div>
             </div>
@@ -193,26 +257,20 @@ def render_results(ticker, result):
             {render_ai_panel("Combined AI Insights", llm_insights, result.get("llm_error"))}
             {render_sentiment_panel("News Sentiment", news_sentiment, result["news_overall_summary"])}
             {render_ai_panel("News AI Insights", result.get("article_llm_insights"), result.get("article_llm_error"))}
+            <div class="panel panel-wide">
+                <h2>Recent News Articles</h2>
+                {render_grouped_content_cards(result['article_df'], "No usable articles were scraped for this ticker.", "Open article")}
+            </div>
             {render_sentiment_panel("EDGAR Filing Sentiment", edgar_sentiment, result["edgar_overall_summary"])}
             {render_ai_panel("EDGAR Filing AI Insights", result.get("edgar_llm_insights"), result.get("edgar_llm_error"))}
-            {render_sentiment_panel("Social Media Sentiment", social_sentiment, result.get("social_overall_summary", "No usable social posts were analyzed for this ticker."))}
-            <div class="panel panel-wide">
-                <h2>Recent Articles</h2>
-                <div class="articles-grid">
-                    {render_content_cards(result['article_df'], "No usable articles were scraped for this ticker.", "Open article")}
-                </div>
-            </div>
-            <div class="panel panel-wide">
-                <h2>Recent Social Posts</h2>
-                <div class="articles-grid">
-                    {render_content_cards(result.get('social_df'), "No usable Reddit posts were found for this ticker.", "Open post")}
-                </div>
-            </div>
             <div class="panel panel-wide">
                 <h2>Recent SEC Filings</h2>
-                <div class="articles-grid">
-                    {render_content_cards(result['edgar_df'], "No recent 8-K, 10-Q, or 10-K filings were captured for this ticker.", "Open filing")}
-                </div>
+                {render_grouped_content_cards(result['edgar_df'], "No recent 8-K, 10-Q, or 10-K filings were captured for this ticker.", "Open filing")}
+            </div>
+            {render_sentiment_panel("Social Media Sentiment", social_sentiment, result.get("social_overall_summary", "No usable social posts were analyzed for this ticker."))}
+            <div class="panel panel-wide">
+                <h2>Recent Social Posts</h2>
+                {render_grouped_content_cards(result.get('social_df'), "No usable Reddit posts were found for this ticker.", "Open post")}
             </div>
         </div>
     """
@@ -229,7 +287,7 @@ def render_page(results_html="", error_message="", ticker_value="", article_coun
     <head>
         <meta charset="utf-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
-        <title>Stock Outlook Demo</title>
+        <title>SignalSift</title>
         <style>
             :root {{
                 --bg: #f4efe6;
@@ -329,6 +387,14 @@ def render_page(results_html="", error_message="", ticker_value="", article_coun
             .articles-grid {{
                 grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
             }}
+            .sentiment-group {{
+                margin-top: 18px;
+            }}
+            .sentiment-group h3 {{
+                margin: 0 0 10px;
+                color: var(--ink);
+                font-size: 1.1rem;
+            }}
             .article-card, .stat-card {{
                 background: white;
                 border: 1px solid #efe5d8;
@@ -411,7 +477,7 @@ def render_page(results_html="", error_message="", ticker_value="", article_coun
     <body>
         <div class="wrap">
             <section class="masthead">
-                <h1>Trader Lens</h1>
+                <h1>SignalSift</h1>
                 <p>Enter a stock ticker and choose how many items to pull per source for company news, SPY news, SEC EDGAR filings, and social posts.</p>
                 <form class="search-panel" method="post">
                     <input
@@ -509,9 +575,9 @@ class StockAppHandler(BaseHTTPRequestHandler):
                     "social_df": None,
                     "social_sentiment_summary": {
                         "article_count": 0,
-                        "average_sentiment_score": 0.0,
-                        "weighted_sentiment_score": 0.0,
-                        "overall_sentiment_score": 0.0,
+                        "average_sentiment_score": 0.5,
+                        "weighted_sentiment_score": 0.5,
+                        "overall_sentiment_score": 0.5,
                         "overall_sentiment_label": "Neutral",
                         "positive_articles": 0,
                         "negative_articles": 0,

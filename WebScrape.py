@@ -18,6 +18,8 @@ SENTIMENT_TO_SCORE = {
     "negative": 0.0,
 }
 
+FINBERT_BATCH_SIZE = int(os.getenv("FINBERT_BATCH_SIZE", "16"))
+
 
 finbert = pipeline(
     "sentiment-analysis",
@@ -126,6 +128,26 @@ def get_finbert_sentiment(text):
     return label, confidence, score
 
 
+def get_finbert_sentiments(texts, batch_size=FINBERT_BATCH_SIZE):
+    prepared_texts = [(text or "")[:512] for text in texts]
+    valid_texts = [text for text in prepared_texts if text]
+    predictions = iter(finbert(valid_texts, batch_size=batch_size)) if valid_texts else iter([])
+    results = []
+
+    for text in prepared_texts:
+        if not text:
+            results.append((None, None, None))
+            continue
+
+        result = next(predictions)
+        label = result["label"]
+        confidence = result["score"]
+        score = SENTIMENT_TO_SCORE.get(label.lower(), 0)
+        results.append((label, confidence, score))
+
+    return results
+
+
 def build_article_dataset(ticker, api_key, days_back=7, delay=1, max_articles=10):
     print(f"\nFetching news for {ticker}...")
 
@@ -137,6 +159,7 @@ def build_article_dataset(ticker, api_key, days_back=7, delay=1, max_articles=10
     print(f"Processing {len(unique_articles)} unique articles...")
 
     data = []
+    sentiment_inputs = []
 
     for index, article in enumerate(unique_articles, start=1):
         print(f"[{index}/{len(unique_articles)}] Scraping: {article['title']}")
@@ -146,7 +169,7 @@ def build_article_dataset(ticker, api_key, days_back=7, delay=1, max_articles=10
             continue
 
         sentiment_input = text if len(text) >= 512 else article["summary"]
-        label, confidence, score = get_finbert_sentiment(sentiment_input)
+        sentiment_inputs.append(sentiment_input)
 
         data.append(
             {
@@ -157,15 +180,17 @@ def build_article_dataset(ticker, api_key, days_back=7, delay=1, max_articles=10
                 "published_date": article["published"].date(),
                 "url": article["url"],
                 "summary": article["summary"],
-                "sentiment_label": label,
-                "sentiment_confidence": confidence,
-                "sentiment_score": score,
                 "text": text,
                 "text_length": len(text),
             }
         )
 
         time.sleep(delay)
+
+    for row, (label, confidence, score) in zip(data, get_finbert_sentiments(sentiment_inputs)):
+        row["sentiment_label"] = label
+        row["sentiment_confidence"] = confidence
+        row["sentiment_score"] = score
 
     return pd.DataFrame(data)
 
@@ -385,6 +410,13 @@ def build_llm_article_context(article_df, max_articles=6, max_chars_per_article=
             for article in type_df.itertuples(index=False):
                 text = safe_string(getattr(article, "text", ""))
                 trimmed_text = text[:max_chars_per_article]
+                body_line = f"Body excerpt: {trimmed_text}"
+                if analysis_type == "edgar":
+                    body_line = (
+                        "Filing context: "
+                        f"Form {safe_string(getattr(article, 'form', ''))}; "
+                        f"themes {safe_string(getattr(article, 'event_tags', 'none detected'))}."
+                    )
                 sections.append(
                     (
                         f"Item {section_index}\n"
@@ -394,7 +426,7 @@ def build_llm_article_context(article_df, max_articles=6, max_chars_per_article=
                         f"FinBERT label: {safe_string(getattr(article, 'sentiment_label', ''))}\n"
                         f"FinBERT score: {safe_string(getattr(article, 'sentiment_score', ''))}\n"
                         f"Summary: {safe_string(getattr(article, 'summary', ''))}\n"
-                        f"Body excerpt: {trimmed_text}"
+                        f"{body_line}"
                     )
                 )
                 section_index += 1
@@ -404,6 +436,14 @@ def build_llm_article_context(article_df, max_articles=6, max_chars_per_article=
     for index, article in enumerate(trimmed_df.itertuples(index=False), start=1):
         text = safe_string(getattr(article, "text", ""))
         trimmed_text = text[:max_chars_per_article]
+        analysis_type = safe_string(getattr(article, "analysis_type", ""))
+        body_line = f"Body excerpt: {trimmed_text}"
+        if analysis_type == "edgar":
+            body_line = (
+                "Filing context: "
+                f"Form {safe_string(getattr(article, 'form', ''))}; "
+                f"themes {safe_string(getattr(article, 'event_tags', 'none detected'))}."
+            )
         sections.append(
             (
                 f"Article {index}\n"
@@ -413,7 +453,7 @@ def build_llm_article_context(article_df, max_articles=6, max_chars_per_article=
                 f"FinBERT label: {safe_string(getattr(article, 'sentiment_label', ''))}\n"
                 f"FinBERT score: {safe_string(getattr(article, 'sentiment_score', ''))}\n"
                 f"Summary: {safe_string(getattr(article, 'summary', ''))}\n"
-                f"Body excerpt: {trimmed_text}"
+                f"{body_line}"
             )
         )
 
